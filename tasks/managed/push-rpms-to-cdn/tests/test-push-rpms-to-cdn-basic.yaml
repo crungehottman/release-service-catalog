@@ -1,0 +1,301 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: test-push-rpms-to-cdn-basic
+spec:
+  description: |
+    Run the push-rpms-to-cdn task with basic advisory metadata - a happy path scenario.
+  params:
+    - name: ociStorage
+      description: The OCI repository where the Trusted Artifacts are stored.
+      type: string
+    - name: ociArtifactExpiresAfter
+      description: Expiration date for the trusted artifacts created in the
+        OCI repository. An empty string means the artifacts do not expire.
+      type: string
+      default: "1d"
+    - name: orasOptions
+      description: oras options to pass to Trusted Artifacts calls
+      type: string
+      default: "--insecure"
+    - name: trustedArtifactsDebug
+      description: Flag to enable debug logging in trusted artifacts. Set to a non-empty string to enable.
+      type: string
+      default: ""
+    - name: dataDir
+      description: The location where data will be stored
+      type: string
+  tasks:
+    - name: setup
+      taskSpec:
+        results:
+          - name: sourceDataArtifact
+            type: string
+        volumes:
+          - name: workdir
+            emptyDir: {}
+        stepTemplate:
+          volumeMounts:
+            - mountPath: /var/workdir
+              name: workdir
+          env:
+            - name: HOME
+              value: /var/workdir
+            - name: IMAGE_EXPIRES_AFTER
+              value: $(params.ociArtifactExpiresAfter)
+            - name: "ORAS_OPTIONS"
+              value: "$(params.orasOptions)"
+            - name: "DEBUG"
+              value: "$(params.trustedArtifactsDebug)"
+        steps:
+          - name: setup-values
+            image: quay.io/konflux-ci/release-service-utils@sha256:5546fa78d3c88d7b6a2e8cff8902f7757f00541d0bbaf113b9f293133894afa3
+            script: |
+              #!/usr/bin/env bash
+              set -eux
+
+              DATA_DIR="$(params.dataDir)/$(context.pipelineRun.uid)"
+              mkdir -p "${DATA_DIR}"
+
+              # Create data.json with push configuration
+              cat > "${DATA_DIR}/data.json" << 'EOF'
+              {
+                "mapping": {
+                  "components": [
+                    {
+                      "name": "test-rpm-component",
+                      "repository": "quay.io/test/test-rpm-component"
+                    }
+                  ]
+                },
+                "pushOptions": {
+                  "pulp_url": "https://rhsm-pulp.example.com",
+                  "exodus_gw_url": "https://exodus-gw.example.com",
+                  "cdn_env": "stage",
+                  "advisory_id": "RHBA-2026:12345",
+                  "dryRun": "true"
+                }
+              }
+              EOF
+
+              # Create snapshot_spec.json
+              cat > "${DATA_DIR}/snapshot_spec.json" << 'EOF'
+              {
+                "application": "test-rpm-app",
+                "componentGroup": "test-rpm-group",
+                "artifacts": {},
+                "components": [
+                  {
+                    "containerImage": "quay.io/test/test-rpm-component@sha256:abc123def456",
+                    "name": "test-rpm-component",
+                    "source": {
+                      "git": {
+                        "revision": "main",
+                        "url": "https://github.com/test/test-rpm-component"
+                      }
+                    }
+                  }
+                ]
+              }
+              EOF
+
+              # Create advisory metadata files
+              ADVISORY_DIR="${DATA_DIR}/advisories/RHBA-2026:12345"
+              mkdir -p "${ADVISORY_DIR}"
+
+              cat > "${ADVISORY_DIR}/advisory_cdn_metadata.json" << 'EOF'
+              {
+                "type": "bugfix",
+                "release": "0",
+                "status": "final",
+                "pushcount": "1",
+                "reboot_suggested": false,
+                "references": [],
+                "pkglist": [
+                  {
+                    "name": "RHBA-2026:12345",
+                    "packages": [
+                      {
+                        "name": "example-app",
+                        "version": "1.0.0",
+                        "release": "1.el10",
+                        "epoch": "0",
+                        "arch": "x86_64",
+                        "filename": "example-app-1.0.0-1.el10.x86_64.rpm",
+                        "sum": ["sha256", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"],
+                        "src": "example-app-1.0.0-1.el10.src.rpm"
+                      }
+                    ]
+                  }
+                ],
+                "from": "release-engineering@redhat.com",
+                "id": "RHBA-2026:12345",
+                "title": "example-app bug fix update",
+                "description": "Test advisory",
+                "version": "1",
+                "updated": "2026-06-04 00:00:00 UTC",
+                "issued": "2026-06-04 00:00:00 UTC",
+                "severity": "None",
+                "summary": "Test advisory",
+                "solution": "Test advisory for development.",
+                "pulp_user_metadata": {
+                  "content_types": ["rpm"]
+                }
+              }
+              EOF
+
+              cat > "${ADVISORY_DIR}/advisory_cdn_filelist.json" << 'EOF'
+              {
+                "example-app-1.0.0-1.el10": {
+                  "rpms": {
+                    "example-app-1.0.0-1.el10.x86_64.rpm": [
+                      "rhel-10-for-x86_64-appstream-rpms__10"
+                    ]
+                  },
+                  "checksums": {
+                    "sha256": {
+                      "example-app-1.0.0-1.el10.x86_64.rpm": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    }
+                  },
+                  "sig_key": "fd431d51"
+                }
+              }
+              EOF
+
+              echo "Setup complete. Data files created."
+              ls -la "${DATA_DIR}/"
+              ls -la "${ADVISORY_DIR}/"
+          - name: create-trusted-artifact
+            ref:
+              name: create-trusted-artifact
+            params:
+              - name: ociStorage
+                value: $(params.ociStorage)
+              - name: workDir
+                value: $(params.dataDir)
+              - name: sourceDataArtifact
+                value: $(results.sourceDataArtifact.path)
+    - name: run-task
+      taskRef:
+        name: push-rpms-to-cdn
+      params:
+        - name: snapshotPath
+          value: "$(context.pipelineRun.uid)/snapshot_spec.json"
+        - name: dataPath
+          value: "$(context.pipelineRun.uid)/data.json"
+        - name: konfluxPulpDomain
+          value: "test-domain"
+        - name: pushSecret
+          value: "cdn-push-secret"
+        - name: pipelineImage
+          value: "quay.io/konflux-ci/release-service-utils@sha256:5546fa78d3c88d7b6a2e8cff8902f7757f00541d0bbaf113b9f293133894afa3"
+        - name: dryRun
+          value: "true"
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: sourceDataArtifact
+          value: "$(tasks.setup.results.sourceDataArtifact)=$(params.dataDir)"
+        - name: ociArtifactExpiresAfter
+          value: $(params.ociArtifactExpiresAfter)
+        - name: trustedArtifactsDebug
+          value: $(params.trustedArtifactsDebug)
+        - name: orasOptions
+          value: $(params.orasOptions)
+        - name: dataDir
+          value: $(params.dataDir)
+        - name: taskGitUrl
+          value: "http://localhost"
+        - name: taskGitRevision
+          value: "main"
+      runAfter:
+        - setup
+    - name: check-result
+      params:
+        - name: sourceDataArtifact
+          value: "$(tasks.run-task.results.sourceDataArtifact)=$(params.dataDir)"
+        - name: dataDir
+          value: $(params.dataDir)
+        - name: pushSummary
+          value: $(tasks.run-task.results.push-summary)
+        - name: logUrl
+          value: $(tasks.run-task.results.log-url)
+      taskSpec:
+        params:
+          - name: sourceDataArtifact
+            type: string
+          - name: dataDir
+            type: string
+          - name: pushSummary
+            type: string
+          - name: logUrl
+            type: string
+        volumes:
+          - name: workdir
+            emptyDir: {}
+        stepTemplate:
+          volumeMounts:
+            - mountPath: /var/workdir
+              name: workdir
+          env:
+            - name: IMAGE_EXPIRES_AFTER
+              value: $(params.ociArtifactExpiresAfter)
+            - name: "ORAS_OPTIONS"
+              value: "$(params.orasOptions)"
+            - name: "DEBUG"
+              value: "$(params.trustedArtifactsDebug)"
+        steps:
+          - name: use-trusted-artifact
+            ref:
+              name: use-trusted-artifact
+            params:
+              - name: workDir
+                value: $(params.dataDir)
+              - name: sourceDataArtifact
+                value: $(params.sourceDataArtifact)
+          - name: check-result
+            image: quay.io/konflux-ci/release-service-utils@sha256:5546fa78d3c88d7b6a2e8cff8902f7757f00541d0bbaf113b9f293133894afa3
+            script: |
+              #!/usr/bin/env bash
+              set -eux
+
+              echo "Push summary: $(params.pushSummary)"
+              echo "Log URL: $(params.logUrl)"
+
+              # Verify push-summary indicates success
+              if [[ "$(params.pushSummary)" != *"success"* ]]; then
+                echo "ERROR: push-summary does not indicate success"
+                echo "Got: $(params.pushSummary)"
+                exit 1
+              fi
+
+              # Verify pubtools-pulp-push was called with expected arguments
+              if [ -f "$(params.dataDir)/mock_pubtools.txt" ]; then
+                echo "pubtools-pulp-push calls:"
+                cat "$(params.dataDir)/mock_pubtools.txt"
+
+                # Verify konflux: source was used
+                if ! grep -q "konflux:" "$(params.dataDir)/mock_pubtools.txt"; then
+                  echo "ERROR: pubtools-pulp-push was not called with konflux: source"
+                  exit 1
+                fi
+
+                # Verify --dry-run was passed
+                if ! grep -q "\-\-dry-run" "$(params.dataDir)/mock_pubtools.txt"; then
+                  echo "ERROR: pubtools-pulp-push was not called with --dry-run"
+                  exit 1
+                fi
+
+                # Verify advisory ID was included
+                if ! grep -q "RHBA-2026:12345" "$(params.dataDir)/mock_pubtools.txt"; then
+                  echo "ERROR: pubtools-pulp-push was not called with advisory ID"
+                  exit 1
+                fi
+              else
+                echo "ERROR: mock_pubtools.txt not found - pubtools-pulp-push was not called"
+                exit 1
+              fi
+
+              echo "All checks passed!"
+      runAfter:
+        - run-task

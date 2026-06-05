@@ -1,0 +1,421 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: push-rpms-to-cdn
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: push-cdn
+spec:
+  description: |-
+    Tekton task to push RPMs from Konflux builds to CDN via rhsm-pulp using pubtools-pulp-push
+  params:
+    - name: snapshotPath
+      type: string
+      description: Path to the JSON file of the mapped Snapshot spec in the data workspace
+    - name: dataPath
+      type: string
+      description: Path to the JSON file of the merged data to use in the data workspace
+    - name: konfluxPulpDomain
+      type: string
+      description: The Konflux Pulp domain to use for retrieving RPM artifacts
+    - name: pushSecret
+      type: string
+      description: The secret containing authentication credentials for rhsm-pulp and exodus-gw
+    - name: pipelineImage
+      type: string
+      description: The container image with pubtools-pulp-push and dependencies
+      default: quay.io/konflux-ci/release-service-utils:latest
+    - name: ociStorage
+      description: The OCI repository where the Trusted Artifacts are stored
+      type: string
+      default: "empty"
+    - name: sourceDataArtifact
+      type: string
+      description: Location of trusted artifacts to be used to populate data directory
+      default: ""
+    - name: ociArtifactExpiresAfter
+      description: Expiration date for the trusted artifacts created in the
+        OCI repository. An empty string means the artifacts do not expire
+      type: string
+      default: "1d"
+    - name: trustedArtifactsDebug
+      description: Flag to enable debug logging in trusted artifacts. Set to a non-empty string to enable
+      type: string
+      default: ""
+    - name: orasOptions
+      description: oras options to pass to Trusted Artifacts calls
+      type: string
+      default: ""
+    - name: dataDir
+      description: The location where data will be stored
+      type: string
+      default: /var/workdir/release
+    - name: taskGitUrl
+      type: string
+      description: The url to the git repo where the release-service-catalog tasks and stepactions to be used are stored
+    - name: taskGitRevision
+      type: string
+      description: The revision in the taskGitUrl repo to be used
+    - name: caTrustConfigMapName
+      type: string
+      description: The name of the ConfigMap to read CA bundle data from
+      default: trusted-ca
+    - name: caTrustConfigMapKey
+      type: string
+      description: The name of the key in the ConfigMap that contains the CA bundle data
+      default: ca-bundle.crt
+    - name: dryRun
+      type: string
+      description: Enable dry-run mode - metadata will be generated and validated, but no actual push will occur
+      default: "false"
+    # TODO: Remove before upstream MR - temporary parameter for testing without real Pulp
+    - name: mockPush
+      type: string
+      description: Mock pubtools-pulp-push for testing (TEMPORARY - remove before MR)
+      default: "false"
+  results:
+    - name: sourceDataArtifact
+      type: string
+      description: Produced trusted data artifact
+    - name: push-summary
+      type: string
+      description: Summary of push operation (success/failure, count)
+    - name: log-url
+      type: string
+      description: URL to full log in Trusted Artifacts
+  volumes:
+    - name: secret-volume
+      secret:
+        secretName: $(params.pushSecret)
+    - name: pulp-access-secret
+      secret:
+        secretName: pulp-access
+    - name: workdir
+      emptyDir: {}
+    - name: trusted-ca
+      configMap:
+        name: $(params.caTrustConfigMapName)
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        optional: true
+  stepTemplate:
+    volumeMounts:
+      - mountPath: /var/workdir
+        name: workdir
+      - name: trusted-ca
+        mountPath: /mnt/trusted-ca
+        readOnly: true
+    env:
+      - name: IMAGE_EXPIRES_AFTER
+        value: $(params.ociArtifactExpiresAfter)
+      - name: "ORAS_OPTIONS"
+        value: "$(params.orasOptions)"
+      - name: "DEBUG"
+        value: "$(params.trustedArtifactsDebug)"
+    securityContext:
+      runAsUser: 1001
+  steps:
+    - name: use-trusted-artifact
+      computeResources:
+        limits:
+          memory: 64Mi
+        requests:
+          memory: 64Mi
+          cpu: 30m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/use-trusted-artifact/use-trusted-artifact.yaml
+      params:
+        - name: workDir
+          value: $(params.dataDir)
+        - name: sourceDataArtifact
+          value: $(params.sourceDataArtifact)
+    - name: push-rpms-to-cdn
+      image: "$(params.pipelineImage)"
+      computeResources:
+        limits:
+          memory: 2Gi
+        requests:
+          memory: 2Gi
+          cpu: 500m
+      env:
+        - name: SNAPSHOT_SPEC_FILE
+          value: $(params.dataDir)/$(params.snapshotPath)
+        - name: DATA_FILE
+          value: $(params.dataDir)/$(params.dataPath)
+        - name: DRY_RUN
+          value: $(params.dryRun)
+        - name: MOCK_PUSH
+          value: $(params.mockPush)
+        - name: HOME
+          value: /tmp
+        # Hosted Pulp (source) credentials for konflux pushsource backend
+        - name: KONFLUX_PULP_URL
+          value: "https://console.redhat.com"
+        - name: KONFLUX_PULP_CERT
+          value: "/etc/pulp-access/tls.crt"
+        - name: KONFLUX_PULP_KEY
+          value: "/etc/pulp-access/tls.key"
+        - name: KONFLUX_PULP_DOMAIN
+          value: $(params.konfluxPulpDomain)
+      script: |
+        #!/usr/bin/env bash
+        set -euxo pipefail
+
+        # TODO: Remove before upstream MR - mock pubtools-pulp-push for testing
+        if [ "${MOCK_PUSH}" = "true" ]; then
+          echo "WARNING: mockPush enabled - using mock pubtools-pulp-push"
+          function pubtools-pulp-push() {
+            echo "MOCK pubtools-pulp-push called with: $*"
+            echo "Mock: Source query skipped"
+            echo "Mock: Push completed successfully (no-op)"
+            return 0
+          }
+          export -f pubtools-pulp-push
+        fi
+
+        if [ ! -f "${SNAPSHOT_SPEC_FILE}" ] ; then
+            echo "No valid snapshot file was provided."
+            exit 1
+        fi
+
+        if [ ! -f "${DATA_FILE}" ] ; then
+            echo "No data JSON was provided."
+            exit 1
+        fi
+
+        # Extract configuration - URLs from secret, with data.json as fallback
+        if [ -f /etc/secret/pulp_url ]; then
+          PULP_URL=$(cat /etc/secret/pulp_url)
+        else
+          PULP_URL=$(jq -r '.pushOptions.pulp_url // empty' "${DATA_FILE}")
+          if [ -z "${PULP_URL}" ]; then
+            echo "ERROR: pulp_url not found in pushSecret or data.json pushOptions"
+            exit 1
+          fi
+        fi
+
+        if [ -f /etc/secret/url ]; then
+          EXODUS_GW_URL=$(cat /etc/secret/url)
+        else
+          EXODUS_GW_URL=$(jq -r '.pushOptions.exodus_gw_url // empty' "${DATA_FILE}")
+          if [ -z "${EXODUS_GW_URL}" ]; then
+            echo "ERROR: exodus_gw_url not found in pushSecret or data.json pushOptions"
+            exit 1
+          fi
+        fi
+
+        CDN_ENV=$(jq -r '.pushOptions.cdn_env // empty' "${DATA_FILE}")
+        if [ -z "${CDN_ENV}" ]; then
+          echo "ERROR: cdn_env not found in data.json pushOptions"
+          exit 1
+        fi
+
+        # Use dryRun from data.json if set, otherwise use task parameter
+        DRY_RUN_FROM_DATA=$(jq -r '.pushOptions.dryRun // empty' "${DATA_FILE}")
+        if [ -n "${DRY_RUN_FROM_DATA}" ]; then
+          DRY_RUN="${DRY_RUN_FROM_DATA}"
+        fi
+
+        # Configure Exodus environment variables for pubtools-exodus hook
+        # The hook will create an exodus-gw publish and commit it after Pulp publish completes
+        export EXODUS_PULP_HOOK_ENABLED="true"
+        export EXODUS_GW_ENV="${CDN_ENV}"
+        export EXODUS_GW_URL="${EXODUS_GW_URL}"
+        export EXODUS_GW_CERT="/etc/secret/cert"
+        export EXODUS_GW_KEY="/etc/secret/key"
+
+        # Get component details from snapshot
+        COMPONENT_GROUP=$(jq -r '.componentGroup' "${SNAPSHOT_SPEC_FILE}")
+        NUM_COMPONENTS=$(jq '.components | length' "${SNAPSHOT_SPEC_FILE}")
+
+        printf 'Start task "%s" for Application "%s"\n\n' "$(context.task.name)" "$COMPONENT_GROUP"
+
+        cd "$(params.dataDir)/$(dirname "$(params.snapshotPath)")"
+
+        # Create log file and working directory
+        LOG_FILE="$(params.dataDir)/cdn-push-$(date +%s).log"
+        WORK_DIR="$(params.dataDir)/cdn-push-work"
+        mkdir -p "${WORK_DIR}"
+
+        echo "=== Push to CDN Task ===" | tee -a "$LOG_FILE"
+        echo "Snapshot: ${SNAPSHOT_SPEC_FILE}" | tee -a "$LOG_FILE"
+        echo "Data: ${DATA_FILE}" | tee -a "$LOG_FILE"
+        echo "Components: ${NUM_COMPONENTS}" | tee -a "$LOG_FILE"
+        echo "Pulp URL: ${PULP_URL}" | tee -a "$LOG_FILE"
+        echo "Exodus GW URL: ${EXODUS_GW_URL}" | tee -a "$LOG_FILE"
+        echo "CDN Environment: ${CDN_ENV}" | tee -a "$LOG_FILE"
+        echo "Dry Run: ${DRY_RUN}" | tee -a "$LOG_FILE"
+        echo "" | tee -a "$LOG_FILE"
+
+        # Extract advisory ID from data
+        ADVISORY_ID=$(jq -r '.pushOptions.advisory_id // empty' "${DATA_FILE}")
+        if [ -z "${ADVISORY_ID}" ]; then
+          echo "ERROR: No advisory_id found in data.json pushOptions" | tee -a "$LOG_FILE"
+          exit 1
+        fi
+
+        echo "Advisory ID: ${ADVISORY_ID}" | tee -a "$LOG_FILE"
+        echo "" | tee -a "$LOG_FILE"
+
+        # Advisory metadata should be placed by a previous pipeline step
+        # Expected structure in workdir:
+        #   $(params.dataDir)/advisories/RHBA-2026:12345/advisory_cdn_metadata.json
+        #   $(params.dataDir)/advisories/RHBA-2026:12345/advisory_cdn_filelist.json
+        ADVISORIES_DIR="$(params.dataDir)/advisories"
+        ADVISORY_DIR="${ADVISORIES_DIR}/${ADVISORY_ID}"
+
+        if [ ! -d "${ADVISORY_DIR}" ]; then
+          echo "ERROR: Advisory directory not found: ${ADVISORY_DIR}" | tee -a "$LOG_FILE"
+          echo "Ensure advisory metadata is placed by a previous pipeline step" | tee -a "$LOG_FILE"
+          exit 1
+        fi
+
+        if [ ! -f "${ADVISORY_DIR}/advisory_cdn_metadata.json" ]; then
+          echo "ERROR: Missing advisory_cdn_metadata.json in ${ADVISORY_DIR}" | tee -a "$LOG_FILE"
+          exit 1
+        fi
+
+        if [ ! -f "${ADVISORY_DIR}/advisory_cdn_filelist.json" ]; then
+          echo "ERROR: Missing advisory_cdn_filelist.json in ${ADVISORY_DIR}" | tee -a "$LOG_FILE"
+          exit 1
+        fi
+
+        echo "Found advisory metadata files:" | tee -a "$LOG_FILE"
+        echo "  - ${ADVISORY_DIR}/advisory_cdn_metadata.json" | tee -a "$LOG_FILE"
+        echo "  - ${ADVISORY_DIR}/advisory_cdn_filelist.json" | tee -a "$LOG_FILE"
+        echo "" | tee -a "$LOG_FILE"
+
+        # TLS certificate paths
+        # Hosted Pulp (source) - from pulp-access secret, referenced by KONFLUX_PULP_* env vars
+        HOSTED_PULP_CERT="${KONFLUX_PULP_CERT}"
+        HOSTED_PULP_KEY="${KONFLUX_PULP_KEY}"
+
+        # RHSM Pulp (target) - from pushSecret
+        RHSM_PULP_CERT="/etc/secret/konflux-release-rhsm-pulp.crt"
+        RHSM_PULP_KEY="/etc/secret/konflux-release-rhsm-pulp.key"
+
+        # Exodus Gateway - from pushSecret, referenced by EXODUS_GW_* env vars
+        EXODUS_CERT="${EXODUS_GW_CERT}"
+        EXODUS_KEY="${EXODUS_GW_KEY}"
+
+        # Verify all certificates exist (skip in dry-run mode)
+        if [ "${DRY_RUN}" != "true" ]; then
+          if [ ! -f "${HOSTED_PULP_CERT}" ] || [ ! -f "${HOSTED_PULP_KEY}" ]; then
+            echo "ERROR: Hosted Pulp TLS certificates not found in pulp-access secret" | tee -a "$LOG_FILE"
+            echo "Expected: ${HOSTED_PULP_CERT} and ${HOSTED_PULP_KEY}" | tee -a "$LOG_FILE"
+            exit 1
+          fi
+          if [ ! -f "${RHSM_PULP_CERT}" ] || [ ! -f "${RHSM_PULP_KEY}" ]; then
+            echo "ERROR: RHSM Pulp TLS certificates not found in pushSecret" | tee -a "$LOG_FILE"
+            echo "Expected: ${RHSM_PULP_CERT} and ${RHSM_PULP_KEY}" | tee -a "$LOG_FILE"
+            exit 1
+          fi
+          if [ ! -f "${EXODUS_CERT}" ] || [ ! -f "${EXODUS_KEY}" ]; then
+            echo "ERROR: Exodus Gateway TLS certificates not found in pushSecret" | tee -a "$LOG_FILE"
+            echo "Expected: ${EXODUS_CERT} and ${EXODUS_KEY}" | tee -a "$LOG_FILE"
+            exit 1
+          fi
+          echo "TLS certificates validated successfully:" | tee -a "$LOG_FILE"
+          echo "  - Hosted Pulp (source): ${HOSTED_PULP_CERT}" | tee -a "$LOG_FILE"
+          echo "  - RHSM Pulp (target): ${RHSM_PULP_CERT}" | tee -a "$LOG_FILE"
+          echo "  - Exodus Gateway: ${EXODUS_CERT}" | tee -a "$LOG_FILE"
+        else
+          echo "Dry-run mode: Skipping certificate validation" | tee -a "$LOG_FILE"
+        fi
+
+        # Build pubtools-pulp-push command with konflux: source
+        PUSH_CMD="pubtools-pulp-push"
+        PUSH_ARGS=(
+          "--source" "konflux:${ADVISORIES_DIR}?advisories=${ADVISORY_ID}"
+          "--pulp-url" "${PULP_URL}"
+          "--pulp-certificate" "${RHSM_PULP_CERT}"
+          "--pulp-certificate-key" "${RHSM_PULP_KEY}"
+          "--clean"
+        )
+
+        # Add UD cache arguments if configured
+        UDCACHE_URL=$(jq -r '.pushOptions.udcache_url // empty' "${DATA_FILE}")
+        UDCACHE_USER=$(jq -r '.pushOptions.udcache_user // empty' "${DATA_FILE}")
+        UDCACHE_PASSWORD=$(jq -r '.pushOptions.udcache_password // empty' "${DATA_FILE}")
+
+        if [ -n "${UDCACHE_URL}" ]; then
+          PUSH_ARGS+=("--udcache-url" "${UDCACHE_URL}")
+          echo "UD cache URL: ${UDCACHE_URL}" | tee -a "$LOG_FILE"
+        fi
+
+        if [ -n "${UDCACHE_USER}" ]; then
+          PUSH_ARGS+=("--udcache-user" "${UDCACHE_USER}")
+        fi
+
+        if [ -n "${UDCACHE_PASSWORD}" ]; then
+          PUSH_ARGS+=("--udcache-password" "${UDCACHE_PASSWORD}")
+        fi
+
+        # Add dry-run flag if enabled
+        if [ "${DRY_RUN}" = "true" ]; then
+          echo "Running in DRY-RUN mode - no actual push will occur" | tee -a "$LOG_FILE"
+          PUSH_ARGS+=("--dry-run")
+        fi
+
+        # Execute push
+        echo "Executing: ${PUSH_CMD} ${PUSH_ARGS[*]}" | tee -a "$LOG_FILE"
+        echo "" | tee -a "$LOG_FILE"
+
+        if "${PUSH_CMD}" "${PUSH_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+          PUSH_STATUS="success"
+          SUMMARY="Successfully pushed advisory ${ADVISORY_ID} to ${CDN_ENV}"
+          echo "" | tee -a "$LOG_FILE"
+          echo "${SUMMARY}" | tee -a "$LOG_FILE"
+        else
+          PUSH_STATUS="failed"
+          SUMMARY="Failed to push advisory ${ADVISORY_ID} to ${CDN_ENV}"
+          echo "" | tee -a "$LOG_FILE"
+          echo "${SUMMARY}" | tee -a "$LOG_FILE"
+          exit 1
+        fi
+
+        # Write results
+        echo "${PUSH_STATUS}: ${SUMMARY}" > $(results.push-summary.path)
+        # Log will be uploaded as trusted artifact, URL will be set by create-trusted-artifact step
+        echo "${LOG_FILE}" > $(results.log-url.path)
+
+        printf 'Completed "%s" for "%s"\n\n' "$(context.task.name)" "$COMPONENT_GROUP"
+      volumeMounts:
+        - mountPath: /etc/secret
+          name: secret-volume
+          readOnly: true
+        - mountPath: /etc/pulp-access
+          name: pulp-access-secret
+          readOnly: true
+    - name: create-trusted-artifact
+      computeResources:
+        limits:
+          memory: 128Mi
+        requests:
+          memory: 128Mi
+          cpu: 250m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: "$(params.taskGitUrl)"
+          - name: revision
+            value: "$(params.taskGitRevision)"
+          - name: pathInRepo
+            value: stepactions/create-trusted-artifact/create-trusted-artifact.yaml
+      params:
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: workDir
+          value: $(params.dataDir)
+        - name: sourceDataArtifact
+          value: $(results.sourceDataArtifact.path)

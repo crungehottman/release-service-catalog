@@ -1,0 +1,340 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: push-rpms-to-cdn-test
+spec:
+  description: |
+    Test pipeline for push-rpms-to-cdn task.
+    Creates test advisory metadata and runs the push task in dry-run mode with mock.
+    Uses a single task to avoid trusted artifact OCI storage requirements.
+  params:
+    - name: release
+      type: string
+    - name: releasePlan
+      type: string
+    - name: releasePlanAdmission
+      type: string
+    - name: releaseServiceConfig
+      type: string
+    - name: snapshot
+      type: string
+  tasks:
+    - name: test-push-rpms-to-cdn
+      taskSpec:
+        results:
+          - name: push-summary
+            type: string
+          - name: log-url
+            type: string
+        volumes:
+          - name: workdir
+            emptyDir: {}
+          - name: secret-volume
+            secret:
+              secretName: cdn-push-secret
+          - name: pulp-access-secret
+            secret:
+              secretName: pulp-access
+          - name: trusted-ca
+            configMap:
+              name: trusted-ca
+              items:
+                - key: ca-bundle.crt
+                  path: ca-bundle.crt
+              optional: true
+        stepTemplate:
+          volumeMounts:
+            - mountPath: /var/workdir
+              name: workdir
+          securityContext:
+            runAsUser: 1001
+        steps:
+          - name: create-test-data
+            image: quay.io/konflux-ci/release-service-utils:latest
+            script: |
+              #!/usr/bin/env bash
+              set -eux
+
+              DATA_DIR="/var/workdir/release"
+              mkdir -p "${DATA_DIR}"
+
+              # Create data.json (simulates what collect-data would produce)
+              cat > "${DATA_DIR}/data.json" << 'DATAEOF'
+              {
+                "mapping": {
+                  "components": [
+                    {
+                      "name": "libecpg-playground",
+                      "repository": "quay.io/test/libecpg-playground"
+                    }
+                  ]
+                },
+                "pushOptions": {
+                  "pulp_url": "https://rhsm-pulp.example.com",
+                  "exodus_gw_url": "https://exodus-gw.example.com",
+                  "cdn_env": "stage",
+                  "advisory_id": "RHBA-2026:12345",
+                  "dryRun": "true"
+                }
+              }
+              DATAEOF
+
+              # Create snapshot_spec.json
+              cat > "${DATA_DIR}/snapshot_spec.json" << 'SNAPEOF'
+              {
+                "application": "test-rpm-app",
+                "componentGroup": "test-rpm-group",
+                "artifacts": {},
+                "components": [
+                  {
+                    "containerImage": "quay.io/test/libecpg-playground@sha256:abc123def456",
+                    "name": "libecpg-playground",
+                    "source": {
+                      "git": {
+                        "revision": "main",
+                        "url": "https://github.com/test/libecpg-playground"
+                      }
+                    }
+                  }
+                ]
+              }
+              SNAPEOF
+
+              # Create advisory metadata files
+              ADVISORY_DIR="${DATA_DIR}/advisories/RHBA-2026:12345"
+              mkdir -p "${ADVISORY_DIR}"
+
+              cat > "${ADVISORY_DIR}/advisory_cdn_metadata.json" << 'METAEOF'
+              {
+                "type": "bugfix",
+                "release": "0",
+                "status": "final",
+                "pushcount": "1",
+                "reboot_suggested": false,
+                "references": [],
+                "pkglist": [
+                  {
+                    "name": "RHBA-2026:12345",
+                    "packages": [
+                      {
+                        "name": "example-app",
+                        "version": "1.0.0",
+                        "release": "1.el10",
+                        "epoch": "0",
+                        "arch": "x86_64",
+                        "filename": "example-app-1.0.0-1.el10.x86_64.rpm",
+                        "sum": ["sha256", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"],
+                        "src": "example-app-1.0.0-1.el10.src.rpm"
+                      }
+                    ]
+                  }
+                ],
+                "from": "release-engineering@redhat.com",
+                "id": "RHBA-2026:12345",
+                "title": "example-app bug fix update",
+                "description": "Test advisory for Konflux RPM CDN push PoC",
+                "version": "1",
+                "updated": "2026-06-04 00:00:00 UTC",
+                "issued": "2026-06-04 00:00:00 UTC",
+                "severity": "None",
+                "summary": "Test advisory",
+                "solution": "Test advisory for development.",
+                "pulp_user_metadata": {
+                  "content_types": ["rpm"]
+                }
+              }
+              METAEOF
+
+              cat > "${ADVISORY_DIR}/advisory_cdn_filelist.json" << 'FILEEOF'
+              {
+                "example-app-1.0.0-1.el10": {
+                  "rpms": {
+                    "example-app-1.0.0-1.el10.x86_64.rpm": [
+                      "rhel-10-for-x86_64-appstream-rpms__10"
+                    ]
+                  },
+                  "checksums": {
+                    "sha256": {
+                      "example-app-1.0.0-1.el10.x86_64.rpm": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    }
+                  },
+                  "sig_key": "fd431d51"
+                }
+              }
+              FILEEOF
+
+              echo "Test data created successfully"
+              ls -la "${DATA_DIR}/"
+              ls -la "${ADVISORY_DIR}/"
+          - name: push-rpms-to-cdn
+            image: quay.io/konflux-ci/release-service-utils:latest
+            env:
+              - name: SNAPSHOT_SPEC_FILE
+                value: /var/workdir/release/snapshot_spec.json
+              - name: DATA_FILE
+                value: /var/workdir/release/data.json
+              - name: DRY_RUN
+                value: "true"
+              - name: MOCK_PUSH
+                value: "true"
+              - name: HOME
+                value: /tmp
+              - name: KONFLUX_PULP_URL
+                value: "https://console.redhat.com"
+              - name: KONFLUX_PULP_CERT
+                value: "/etc/pulp-access/tls.crt"
+              - name: KONFLUX_PULP_KEY
+                value: "/etc/pulp-access/tls.key"
+              - name: KONFLUX_PULP_DOMAIN
+                value: "konflux-crungeho-tenant"
+            script: |
+              #!/usr/bin/env bash
+              set -euxo pipefail
+
+              # TODO: Remove before upstream MR - mock pubtools-pulp-push for testing
+              if [ "${MOCK_PUSH}" = "true" ]; then
+                echo "WARNING: mockPush enabled - using mock pubtools-pulp-push"
+                function pubtools-pulp-push() {
+                  echo "MOCK pubtools-pulp-push called with: $*"
+                  echo "Mock: Source query skipped"
+                  echo "Mock: Push completed successfully (no-op)"
+                  return 0
+                }
+                export -f pubtools-pulp-push
+              fi
+
+              if [ ! -f "${SNAPSHOT_SPEC_FILE}" ] ; then
+                  echo "No valid snapshot file was provided."
+                  exit 1
+              fi
+
+              if [ ! -f "${DATA_FILE}" ] ; then
+                  echo "No data JSON was provided."
+                  exit 1
+              fi
+
+              # Extract configuration from data.json
+              PULP_URL=$(jq -r '.pushOptions.pulp_url // empty' "${DATA_FILE}")
+              if [ -z "${PULP_URL}" ]; then
+                echo "ERROR: pulp_url not found in data.json pushOptions"
+                exit 1
+              fi
+
+              EXODUS_GW_URL=$(jq -r '.pushOptions.exodus_gw_url // empty' "${DATA_FILE}")
+              if [ -z "${EXODUS_GW_URL}" ]; then
+                echo "ERROR: exodus_gw_url not found in data.json pushOptions"
+                exit 1
+              fi
+
+              CDN_ENV=$(jq -r '.pushOptions.cdn_env // empty' "${DATA_FILE}")
+              if [ -z "${CDN_ENV}" ]; then
+                echo "ERROR: cdn_env not found in data.json pushOptions"
+                exit 1
+              fi
+
+              # Use dryRun from data.json if set, otherwise use env var
+              DRY_RUN_FROM_DATA=$(jq -r '.pushOptions.dryRun // empty' "${DATA_FILE}")
+              if [ -n "${DRY_RUN_FROM_DATA}" ]; then
+                DRY_RUN="${DRY_RUN_FROM_DATA}"
+              fi
+
+              # Configure Exodus environment variables
+              export EXODUS_PULP_HOOK_ENABLED="true"
+              export EXODUS_GW_ENV="${CDN_ENV}"
+              export EXODUS_GW_URL="${EXODUS_GW_URL}"
+              export EXODUS_GW_CERT="/etc/secret/cert"
+              export EXODUS_GW_KEY="/etc/secret/key"
+
+              # Get component details from snapshot
+              COMPONENT_GROUP=$(jq -r '.componentGroup' "${SNAPSHOT_SPEC_FILE}")
+              NUM_COMPONENTS=$(jq '.components | length' "${SNAPSHOT_SPEC_FILE}")
+
+              printf 'Start task for Application "%s"\n\n' "$COMPONENT_GROUP"
+
+              cd "/var/workdir/release"
+
+              # Create log file
+              LOG_FILE="/var/workdir/release/cdn-push-$(date +%s).log"
+              WORK_DIR="/var/workdir/release/cdn-push-work"
+              mkdir -p "${WORK_DIR}"
+
+              echo "=== Push to CDN Task ===" | tee -a "$LOG_FILE"
+              echo "Components: ${NUM_COMPONENTS}" | tee -a "$LOG_FILE"
+              echo "Pulp URL: ${PULP_URL}" | tee -a "$LOG_FILE"
+              echo "Exodus GW URL: ${EXODUS_GW_URL}" | tee -a "$LOG_FILE"
+              echo "CDN Environment: ${CDN_ENV}" | tee -a "$LOG_FILE"
+              echo "Dry Run: ${DRY_RUN}" | tee -a "$LOG_FILE"
+              echo "" | tee -a "$LOG_FILE"
+
+              # Extract advisory ID
+              ADVISORY_ID=$(jq -r '.pushOptions.advisory_id // empty' "${DATA_FILE}")
+              if [ -z "${ADVISORY_ID}" ]; then
+                echo "ERROR: No advisory_id found in data.json pushOptions" | tee -a "$LOG_FILE"
+                exit 1
+              fi
+
+              echo "Advisory ID: ${ADVISORY_ID}" | tee -a "$LOG_FILE"
+
+              # Verify advisory metadata
+              ADVISORIES_DIR="/var/workdir/release/advisories"
+              ADVISORY_DIR="${ADVISORIES_DIR}/${ADVISORY_ID}"
+
+              if [ ! -d "${ADVISORY_DIR}" ]; then
+                echo "ERROR: Advisory directory not found: ${ADVISORY_DIR}" | tee -a "$LOG_FILE"
+                exit 1
+              fi
+
+              if [ ! -f "${ADVISORY_DIR}/advisory_cdn_metadata.json" ]; then
+                echo "ERROR: Missing advisory_cdn_metadata.json" | tee -a "$LOG_FILE"
+                exit 1
+              fi
+
+              if [ ! -f "${ADVISORY_DIR}/advisory_cdn_filelist.json" ]; then
+                echo "ERROR: Missing advisory_cdn_filelist.json" | tee -a "$LOG_FILE"
+                exit 1
+              fi
+
+              echo "Found advisory metadata files" | tee -a "$LOG_FILE"
+              echo "Dry-run mode: Skipping certificate validation" | tee -a "$LOG_FILE"
+
+              # Build pubtools-pulp-push command
+              PUSH_CMD="pubtools-pulp-push"
+              PUSH_ARGS=(
+                "--source" "konflux:${ADVISORIES_DIR}?advisories=${ADVISORY_ID}"
+                "--pulp-url" "${PULP_URL}"
+                "--pulp-certificate" "/etc/secret/konflux-release-rhsm-pulp.crt"
+                "--pulp-certificate-key" "/etc/secret/konflux-release-rhsm-pulp.key"
+                "--clean"
+              )
+
+              if [ "${DRY_RUN}" = "true" ]; then
+                echo "Running in DRY-RUN mode" | tee -a "$LOG_FILE"
+                PUSH_ARGS+=("--dry-run")
+              fi
+
+              echo "Executing: ${PUSH_CMD} ${PUSH_ARGS[*]}" | tee -a "$LOG_FILE"
+
+              if "${PUSH_CMD}" "${PUSH_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+                SUMMARY="Successfully pushed advisory ${ADVISORY_ID} to ${CDN_ENV}"
+                echo "${SUMMARY}" | tee -a "$LOG_FILE"
+                echo "success: ${SUMMARY}" > $(results.push-summary.path)
+              else
+                SUMMARY="Failed to push advisory ${ADVISORY_ID} to ${CDN_ENV}"
+                echo "${SUMMARY}" | tee -a "$LOG_FILE"
+                echo "failed: ${SUMMARY}" > $(results.push-summary.path)
+                exit 1
+              fi
+
+              echo "${LOG_FILE}" > $(results.log-url.path)
+              printf 'Completed push for "%s"\n' "$COMPONENT_GROUP"
+            volumeMounts:
+              - mountPath: /etc/secret
+                name: secret-volume
+                readOnly: true
+              - mountPath: /etc/pulp-access
+                name: pulp-access-secret
+                readOnly: true
+              - mountPath: /mnt/trusted-ca
+                name: trusted-ca
+                readOnly: true
